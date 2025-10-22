@@ -44,7 +44,11 @@ def search_youtube(query):
     try:
         with yt_dlp.YoutubeDL(YDL_SEARCH_OPTS) as ydl:
             info = ydl.extract_info(f"ytsearch:{query}", download=False)['entries'][0]
-            result = {'url': info.get('url'), 'title': info.get('title', 'Untitled'), 'stream_url': None}
+            
+            # --- THAY ĐỔI LOGIC (GIỐNG SUISEI-BOT) ---
+            # Ưu tiên 'webpage_url' (link vĩnh viễn) và không lưu 'stream_url'
+            result = {'url': info.get('webpage_url', info.get('url')), 'title': info.get('title', 'Untitled')}
+            
             with cache_lock:
                 song_cache[query] = result
                 save_cache(song_cache)
@@ -58,6 +62,7 @@ def get_stream_data(youtube_url):
     try:
         with yt_dlp.YoutubeDL(YDL_STREAM_OPTS) as ydl:
             info = ydl.extract_info(youtube_url, download=False)
+            # Trả về link stream tạm thời ('source')
             return {'source': info['url'], 'title': info.get('title', 'Untitled')}
     except Exception as e:
         print(f"Failed to get stream for '{youtube_url}': {e}")
@@ -70,45 +75,46 @@ class MusicCog(commands.Cog):
         self.music_queues = {}
         self.loop_states = {}
 
-    # CẢI TIẾN: TẢI TRƯỚC BÀI HÁT TIẾP THEO
-    async def prefetch_next_song(self, guild_id):
-        queue = self.music_queues.get(guild_id)
-        if not queue or len(queue) < 2:
-            return
-        
-        next_song = queue[1]
-        if next_song.get('stream_url') is None:
-            print(f"Prefetching: {next_song['title']}")
-            stream_data = await self.bot.loop.run_in_executor(None, get_stream_data, next_song['url'])
-            if stream_data:
-                next_song['stream_url'] = stream_data['source']
+    # --- ĐÃ XÓA HÀM prefetch_next_song ---
+    # Logic tải trước đã bị loại bỏ để tránh lưu link stream hết hạn.
 
+    # --- HÀM play_next_song VIẾT LẠI (GIỐNG SUISEI-BOT) ---
     async def play_next_song(self, interaction: discord.Interaction):
         guild_id = interaction.guild.id
         voice_client = interaction.guild.voice_client
         
         if not voice_client: return
-        if voice_client.is_playing(): return
+
+        # Dừng nếu bot đang chạy (tránh lỗi)
+        if voice_client.is_playing():
+            voice_client.stop()
 
         queue = self.music_queues.get(guild_id)
         if not queue:
+            # Logic rảnh rỗi và tự ngắt kết nối
             await asyncio.sleep(120)
             if voice_client.is_connected() and not voice_client.is_playing():
                 await voice_client.disconnect()
             return
         
         current_song = queue[0]
-        # Sử dụng stream_url đã được tải trước nếu có
-        if current_song.get('stream_url') is None:
-            stream_data = await self.bot.loop.run_in_executor(None, get_stream_data, current_song['url'])
-            if not stream_data:
-                await interaction.channel.send(f"❌ Lỗi khi lấy stream cho **{current_song['title']}**. Bỏ qua.")
-                self.music_queues[guild_id].popleft()
-                self.bot.loop.create_task(self.play_next_song(interaction))
-                return
-            current_song['stream_url'] = stream_data['source']
         
-        source = discord.FFmpegPCMAudio(current_song['stream_url'], **FFMPEG_OPTIONS)
+        # --- THAY ĐỔI CHÍNH ---
+        # Không kiểm tra 'stream_url' nữa.
+        # LUÔN LUÔN lấy link stream mới ngay trước khi phát.
+        
+        # current_song['url'] lúc này là link vĩnh viễn (webpage_url)
+        stream_data = await self.bot.loop.run_in_executor(None, get_stream_data, current_song['url'])
+        
+        if not stream_data:
+            await interaction.channel.send(f"❌ Lỗi khi lấy stream cho **{current_song['title']}**. Bỏ qua.")
+            self.music_queues[guild_id].popleft()
+            # Đệ quy để thử phát bài tiếp theo
+            self.bot.loop.create_task(self.play_next_song(interaction))
+            return
+        
+        # Sử dụng stream_data['source'] (link stream tạm thời) trực tiếp
+        source = discord.FFmpegPCMAudio(stream_data['source'], **FFMPEG_OPTIONS)
 
         def after_playing(error):
             if error: print(f'Player error: {error}')
@@ -117,23 +123,23 @@ class MusicCog(commands.Cog):
             if not q: return
 
             loop_state = self.loop_states.get(guild_id)
+            
+            # Logic lặp bài
             if loop_state == 'queue':
                 played_song = q.popleft()
                 q.append(played_song)
             elif loop_state != 'song':
-                q.popleft()
+                q.popleft() # Chỉ xóa khỏi hàng đợi nếu không lặp bài hát
             
-            # Reset stream_url để có thể lấy lại khi cần
-            if q:
-                q[0]['stream_url'] = None
-
+            # Không cần reset 'stream_url' vì nó không còn tồn tại
+            
+            # Gọi tác vụ để phát bài tiếp theo
             self.bot.loop.create_task(self.play_next_song(interaction))
 
         voice_client.play(source, after=after_playing)
         await interaction.channel.send(f"▶️ Đang phát: **{current_song['title']}**")
         
-        # Bắt đầu tải trước bài hát tiếp theo
-        self.bot.loop.create_task(self.prefetch_next_song(guild_id))
+        # Đã xóa dòng gọi hàm prefetch_next_song
 
     # CẢI TIẾN: XỬ LÝ PLAYLIST SONG SONG
     async def process_playlist_concurrently(self, ctx: commands.Context, track_queries: list):
