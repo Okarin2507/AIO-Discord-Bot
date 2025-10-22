@@ -10,4 +10,4 @@ __pycache__/
 # Các tệp tạm hoặc cục bộ khác
 cookies.txt
 cache.json
-memory.dbgit 
+memory.db
